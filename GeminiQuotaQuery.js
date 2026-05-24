@@ -3,7 +3,7 @@
 // @namespace    http://tampermonkey.net/
 // @version      1.0.0
 // @description  https://github.com/xykcloud/TampermonkeyScript
-// @author       JDC
+// @author       xykcloud
 // @match        https://gemini.google.com/*
 // @grant        none
 // ==/UserScript==
