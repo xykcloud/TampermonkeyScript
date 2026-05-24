@@ -146,7 +146,7 @@
         panel.style.cssText = 'background:#fff; padding:15px; border:4px solid #1a73e8; border-radius:12px; box-shadow:0 10px 30px rgba(0,0,0,0.4); width:390px; pointer-events:auto;';
 
         var title = document.createElement('div');
-        title.textContent = '谷歌相册自动保存助手 v73.0';
+        title.textContent = '谷歌相册自动保存助手';
         title.style.cssText = 'font-weight:bold; color:#1a73e8; text-align:center; margin-bottom:12px; font-size:15px; user-select:none; border-bottom: 2px solid #eee; padding-bottom: 8px;';
         panel.appendChild(title);
 
