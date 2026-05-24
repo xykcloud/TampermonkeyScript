@@ -6,6 +6,7 @@
 // @author       xykcloud
 // @match        https://gemini.google.com/*
 // @grant        none
+// @license      GPL v3
 // ==/UserScript==
 
 (function () {
