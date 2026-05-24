@@ -8,6 +8,7 @@
 // @match        *://photos.google.com/share/*
 // @match        *://photos.google.com/partner/*
 // @match        *://*.googleusercontent.com/*
+// @license      GPL v3
 // @grant        none
 // @run-at       document-start
 // @allFrames    true
@@ -20,10 +21,10 @@
         window.trustedTypes.createPolicy('default', { createHTML: function(s) { return s; } });
     }
 
-    var STORAGE_KEY = 'gp_save_prog_v73';
-    var AUTO_RUN_KEY = 'gp_active_v73';
-    var SETTINGS_KEY = 'gp_settings_v73';
-    var LAST_RESULT_KEY = 'gp_last_res_v73';
+    var STORAGE_KEY = 'gp_save_prog_v1';
+    var AUTO_RUN_KEY = 'gp_active_v1';
+    var SETTINGS_KEY = 'gp_settings_v1';
+    var LAST_RESULT_KEY = 'gp_last_res_v1';
 
     (function migrateOldData() {
         var current = localStorage.getItem(STORAGE_KEY);
