@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Gemini配额查询/Gemini Quota Query
 // @namespace    http://tampermonkey.net/
-// @version      11.0.0
+// @version      1.0.0
 // @description  https://github.com/xykcloud/TampermonkeyScript
 // @author       JDC
 // @match        https://gemini.google.com/*
