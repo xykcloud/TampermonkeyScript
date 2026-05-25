@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Gemini配额查询/Gemini Quota Query
 // @namespace    http://tampermonkey.net/
-// @version      2.1.0
+// @version      2.2.0
 // @description  Gemini配额查询/Gemini Quota Query，https://github.com/xykcloud/TampermonkeyScript
 // @author       xykcloud
 // @match        https://gemini.google.com/*
@@ -56,7 +56,13 @@
     };
 
     /* ── 工具 ── */
+    // 优先检测 Gemini 自身的 body class（dark-theme / light-theme），降级到系统 prefers-color-scheme
     function isDark() {
+        var body = document.body;
+        if (body) {
+            if (body.classList.contains('dark-theme'))  return true;
+            if (body.classList.contains('light-theme')) return false;
+        }
         return !!(window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches);
     }
     function getAccountIndex() {
@@ -382,8 +388,8 @@
         w.style.right         = '20px';
         w.style.minWidth      = '200px';
         w.style.maxWidth      = '240px';
-        w.style.background    = dark ? 'rgba(28,28,30,0.94)' : 'rgba(255,255,255,0.98)';
-        w.style.color         = dark ? '#f2f2f7' : '#1c1c1e';
+        w.style.background    = dark ? 'rgba(60,60,65,0.96)' : 'rgba(255,255,255,0.98)';
+        w.style.color         = dark ? '#ffffff' : '#1c1c1e';
         w.style.border        = '1px solid ' + theme.border;
         w.style.borderRadius  = '12px';
         w.style.padding       = '10px 14px';
@@ -406,7 +412,6 @@
         hd.style.borderBottom   = '1px solid ' + theme.border;
 
         var title = mkSpan();
-        title.style.fontWeight = '600';
         title.style.fontSize   = '13px';
         title.style.color      = theme.textMain;
         title.style.fontFamily = FONT;
@@ -525,8 +530,8 @@
         w.style.position      = 'fixed';
         w.style.bottom        = '20px';
         w.style.right         = '20px';
-        w.style.background    = dark ? 'rgba(28,28,30,0.94)' : 'rgba(255,255,255,0.98)';
-        w.style.color         = dark ? '#f2f2f7' : '#1c1c1e';
+        w.style.background    = dark ? 'rgba(60,60,65,0.96)' : 'rgba(255,255,255,0.98)';
+        w.style.color         = dark ? '#ffffff' : '#1c1c1e';
         w.style.border        = '1px solid ' + theme.border;
         w.style.borderRadius  = '20px';
         w.style.padding       = '5px 12px';
@@ -625,10 +630,10 @@
 
         var dark  = isDark();
         var theme = {
-            textMain: dark ? '#f2f2f7' : '#1c1c1e',
-            textSub:  dark ? '#8e8e93' : '#6e6e73',
-            accent:   dark ? '#64d2ff' : '#007aff',
-            border:   dark ? '#3a3a3c' : '#d1d1d6'
+            textMain: dark ? '#ffffff'  : '#1c1c1e',
+            textSub:  dark ? '#c8c8cc'  : '#6e6e73',
+            accent:   dark ? '#64d2ff'  : '#007aff',
+            border:   dark ? '#48484a'  : '#d1d1d6'
         };
 
         var w = document.getElementById(WIDGET_ID);
@@ -665,6 +670,16 @@
         window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', function () {
             render(getCached(CACHE_KEY) ? 'ok' : 'nodata', getCached(CACHE_KEY));
         });
+
+        // 监听 Gemini body class 变化（dark-theme / light-theme），实时同步插件配色
+        var _lastDark = isDark();
+        new MutationObserver(function () {
+            var nowDark = isDark();
+            if (nowDark !== _lastDark) {
+                _lastDark = nowDark;
+                render(_lastState, _lastData);
+            }
+        }).observe(document.body, { attributes: true, attributeFilter: ['class'] });
 
         var lastPath = location.pathname;
         new MutationObserver(function () {
