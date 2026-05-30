@@ -1,42 +1,42 @@
 // ==UserScript==
 // @name         Gemini配额查询/Gemini Quota Query
 // @namespace    http://tampermonkey.net/
-// @version      2.2.0
+// @version      2.3.0
 // @description  Gemini配额查询/Gemini Quota Query，https://github.com/xykcloud/TampermonkeyScript
 // @author       xykcloud
 // @match        https://gemini.google.com/*
 // @grant        none
 // @license      GPL v3
 // ==/UserScript==
-
+ 
 (function () {
     'use strict';
-
+ 
     var CACHE_KEY        = 'gemini_quota_v7';
     var SKIN_KEY         = 'gemini_quota_skin';
     var INTERVAL_KEY     = 'gemini_quota_interval';
     var WIDGET_ID        = 'gq-monitor-v32';
     var POLL_MAX         = 40;
     var INTERVAL_OPTIONS = [1, 2, 3, 5, 10, 0];
-
+ 
     var autoTimer      = null;
     var uiRefreshTimer = null;
     var countdownSecs  = 0;
     var _lastState     = 'nodata';
     var _lastData      = null;
-
+ 
     /* ── 字体：微软雅黑优先，降级到系统中英文默认字体 ── */
     var FONT = '"Microsoft YaHei","微软雅黑","PingFang SC","Hiragino Sans GB","WenQuanYi Micro Hei",system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif';
-
+ 
     /* ── 语言 ── */
     function isZh() {
         var lang = (navigator.language || navigator.userLanguage || 'zh').toLowerCase();
         return lang.startsWith('zh');
     }
-
+ 
     var ZH  = isZh();
     var COL = ZH ? '：' : ': ';
-
+ 
     var T = {
         title:       ZH ? 'Gemini 配额'         : 'Gemini Quota',
         loading:     ZH ? '读取中…'             : 'Loading…',
@@ -54,7 +54,7 @@
         cdLabel:     ZH ? '刷新倒计时' + COL     : 'Next refresh' + COL,
         autoRefOff:  ZH ? '自动刷新' + COL + '关': 'Auto refresh: OFF'
     };
-
+ 
     /* ── 工具 ── */
     // 优先检测 Gemini 自身的 body class（dark-theme / light-theme），降级到系统 prefers-color-scheme
     function isDark() {
@@ -95,12 +95,12 @@
         var s = secs % 60;
         return (m < 10 ? '0' : '') + m + ':' + (s < 10 ? '0' : '') + s;
     }
-
+ 
     /* ── DOM 工厂 ── */
     function mkDiv()  { return document.createElement('div'); }
     function mkSpan() { return document.createElement('span'); }
     function setText(el, txt) { el.textContent = txt; return el; }
-
+ 
     function createHollowShirtIcon() {
         var ns  = 'http://www.w3.org/2000/svg';
         var svg = document.createElementNS(ns, 'svg');
@@ -117,7 +117,7 @@
         svg.appendChild(path);
         return svg;
     }
-
+ 
     /* ══════════════════════════════════════════════
        Usage 页面解析
     ══════════════════════════════════════════════ */
@@ -128,9 +128,9 @@
         var isChinese = text.includes('已使用') && text.includes('重置时间');
         var isEnglish = /\d+%\s*used/i.test(text) && /resets/i.test(text);
         if (!isChinese && !isEnglish) return null;
-
+ 
         var cu = '—', cr = '—', wu = '—', wr = '—';
-
+ 
         function extractFromBlock(block) {
             if (!block) return { usage: '—', reset: '—' };
             var t = block.innerText || block.textContent || '';
@@ -148,11 +148,11 @@
             }
             return { usage: usage, reset: reset };
         }
-
+ 
         var currentBlock = container.querySelector('.gxu-currently');
         var weeklyBlock  = container.querySelector('.gxu-weekly') ||
                            container.querySelector('[class*="gxu-item"]:not(.gxu-currently)');
-
+ 
         if (currentBlock || weeklyBlock) {
             var cur = extractFromBlock(currentBlock);
             var wkl = extractFromBlock(weeklyBlock);
@@ -175,11 +175,11 @@
                 if (rm3[1]) wr = rm3[1].replace(/resets?(?:\s+on|\s+in)?\s*/i, '').trim();
             }
         }
-
+ 
         if (cu === '—' && wu === '—') return null;
         return { cu: cu, cr: cr, wu: wu, wr: wr, ts: Date.now() };
     }
-
+ 
     function runOnUsagePage() {
         if (location.hash === '#gq-auto') {
             try {
@@ -212,7 +212,7 @@
             }
         }, 500);
     }
-
+ 
     /* ══════════════════════════════════════════════
        后台弹窗刷新
     ══════════════════════════════════════════════ */
@@ -220,13 +220,13 @@
         var beforeTs = 0;
         var c = getCached(CACHE_KEY);
         if (c) beforeTs = c.ts;
-
+ 
         var features = [
             'width=1', 'height=1', 'left=99999', 'top=99999',
             'toolbar=no', 'menubar=no', 'scrollbars=no', 'resizable=no',
             'status=no', 'location=no', 'alwaysLowered=yes', 'alwaysRaised=no'
         ].join(',');
-
+ 
         var tab = window.open(getUsageUrl() + '#gq-auto', '_blank', features);
         if (tab) {
             try { tab.blur(); window.focus(); } catch (e) {}
@@ -245,9 +245,9 @@
         } else {
             window.open(getUsageUrl() + '#gq-auto', '_blank');
         }
-
+ 
         render('loading', null);
-
+ 
         var attempts = 0;
         var poll = setInterval(function () {
             attempts++;
@@ -266,63 +266,63 @@
             }
         }, 500);
     }
-
+ 
     /* ── 定时器与倒计时 ── */
     function scheduleNext() {
         if (autoTimer)      { clearTimeout(autoTimer);       autoTimer      = null; }
         if (uiRefreshTimer) { clearInterval(uiRefreshTimer); uiRefreshTimer = null; }
-
+ 
         var intervalMins = getRefreshIntervalMinutes();
         if (intervalMins === 0) {
             countdownSecs = 0;
             updateCountdownDisplay();
             return;
         }
-
+ 
         countdownSecs = intervalMins * 60;
         updateCountdownDisplay();
-
+ 
         uiRefreshTimer = setInterval(function () {
             if (countdownSecs > 0) countdownSecs--;
             updateCountdownDisplay();
         }, 1000);
-
+ 
         autoTimer = setTimeout(function () {
             if (uiRefreshTimer) { clearInterval(uiRefreshTimer); uiRefreshTimer = null; }
             openUsageWindow();
         }, intervalMins * 60 * 1000);
     }
-
+ 
     function updateCountdownDisplay() {
         var intervalMins = getRefreshIntervalMinutes();
-
+ 
         var cdStd = document.getElementById('gq-countdown');
         if (cdStd) {
             setText(cdStd, intervalMins === 0
                 ? T.autoRefOff
                 : T.cdLabel + fmtCountdown(countdownSecs));
         }
-
+ 
         var cdMin = document.getElementById('gq-countdown-min');
         if (cdMin) {
             setText(cdMin, intervalMins === 0
                 ? T.timerOff
                 : fmtCountdown(countdownSecs));
         }
-
+ 
         var ageNode = document.getElementById('gq-age-text');
         if (ageNode && _lastData) {
             var age = Math.round((Date.now() - _lastData.ts) / 60000);
             setText(ageNode, age < 1 ? T.justNow : (age + T.minutesAgo));
         }
     }
-
+ 
     /* ── 皮肤 & 周期切换 ── */
     function toggleSkinMode() {
         localStorage.setItem(SKIN_KEY, getSkinMode() === 'standard' ? 'minimal' : 'standard');
         render(_lastState, _lastData);
     }
-
+ 
     function cycleRefreshInterval() {
         var cur = getRefreshIntervalMinutes();
         var idx = INTERVAL_OPTIONS.indexOf(cur);
@@ -331,7 +331,7 @@
         scheduleNext();
         render(_lastState, _lastData);
     }
-
+ 
     /* ── 按钮组 ── */
     function createActionControls(theme) {
         var group = mkDiv();
@@ -340,10 +340,10 @@
         group.style.gap        = '8px';
         group.style.userSelect = 'none';
         group.style.flexShrink = '0';
-
+ 
         var intervalMins = getRefreshIntervalMinutes();
         var timerLabel   = intervalMins === 0 ? T.timerOff : intervalMins + T.timerMin;
-
+ 
         var timerBtn = mkSpan();
         timerBtn.style.cursor     = 'pointer';
         timerBtn.style.fontSize   = '13px';
@@ -352,7 +352,7 @@
         setText(timerBtn, '⏱');
         timerBtn.title   = T.timerSetting + ' (' + timerLabel + ')';
         timerBtn.onclick = cycleRefreshInterval;
-
+ 
         var skinBtn = mkSpan();
         skinBtn.style.cursor     = 'pointer';
         skinBtn.style.color      = theme.textSub;
@@ -361,7 +361,7 @@
         skinBtn.title   = T.toggleSkin;
         skinBtn.onclick = toggleSkinMode;
         skinBtn.appendChild(createHollowShirtIcon());
-
+ 
         var refreshBtn = mkSpan();
         refreshBtn.style.cursor     = 'pointer';
         refreshBtn.style.fontSize   = '15px';
@@ -370,19 +370,19 @@
         setText(refreshBtn, '↻');
         refreshBtn.title   = T.refresh;
         refreshBtn.onclick = openUsageWindow;
-
+ 
         group.appendChild(timerBtn);
         group.appendChild(skinBtn);
         group.appendChild(refreshBtn);
         return group;
     }
-
+ 
     /* ══════════════════════════════════════════════
        标准皮肤
     ══════════════════════════════════════════════ */
     function buildStandardView(w, state, data, theme) {
         var dark = isDark();
-
+ 
         w.style.position      = 'fixed';
         w.style.bottom        = '20px';
         w.style.right         = '20px';
@@ -401,7 +401,7 @@
         w.style.display       = 'flex';
         w.style.flexDirection = 'column';
         w.style.gap           = '0px';
-
+ 
         /* 第一行：标题左，按钮组右 */
         var hd = mkDiv();
         hd.style.display        = 'flex';
@@ -410,17 +410,17 @@
         hd.style.paddingBottom  = '8px';
         hd.style.marginBottom   = '4px';
         hd.style.borderBottom   = '1px solid ' + theme.border;
-
+ 
         var title = mkSpan();
         title.style.fontSize   = '13px';
         title.style.color      = theme.textMain;
         title.style.fontFamily = FONT;
         setText(title, T.title);
-
+ 
         hd.appendChild(title);
         hd.appendChild(createActionControls(theme));
         w.appendChild(hd);
-
+ 
         /* 状态行 */
         if (state === 'loading' || state === 'nodata') {
             var msg = mkDiv();
@@ -433,7 +433,7 @@
             w.appendChild(msg);
             return;
         }
-
+ 
         /*
          * 数据行布局（标准皮肤）：
          *
@@ -450,24 +450,24 @@
             row.style.justifyContent = 'space-between';
             row.style.alignItems     = 'baseline';
             row.style.marginTop      = '6px';
-
+ 
             var lb = mkSpan();
             lb.style.color      = theme.textMain;
             lb.style.fontSize   = '13px';
             lb.style.fontFamily = FONT;
             setText(lb, label + COL);
-
+ 
             var vl = mkSpan();
             vl.style.fontWeight = '700';
             vl.style.fontSize   = '15px';
             vl.style.color      = theme.accent;
             vl.style.fontFamily = FONT;
             setText(vl, val);
-
+ 
             row.appendChild(lb);
             row.appendChild(vl);
             w.appendChild(row);
-
+ 
             /* 重置时间行：左对齐 */
             var rs = mkDiv();
             rs.style.fontSize   = '11px';
@@ -478,24 +478,24 @@
             setText(rs, T.resetLabel + resetVal);
             w.appendChild(rs);
         }
-
+ 
         if (state === 'ok' && data) {
             addRow(T.current, data.cu, data.cr);
             addRow(T.weekly,  data.wu, data.wr);
-
+ 
             /* 分割线 */
             var divider = mkDiv();
             divider.style.borderTop  = '1px solid ' + theme.border;
             divider.style.marginTop  = '8px';
             divider.style.paddingTop = '6px';
             w.appendChild(divider);
-
+ 
             /* 底部：更新时间（左）+ 刷新倒计时（右） */
             var footer = mkDiv();
             footer.style.display        = 'flex';
             footer.style.justifyContent = 'space-between';
             footer.style.alignItems     = 'center';
-
+ 
             var ageSpan = mkSpan();
             ageSpan.id             = 'gq-age-text';
             ageSpan.style.fontSize = '11px';
@@ -503,7 +503,7 @@
             ageSpan.style.fontFamily = FONT;
             var age = Math.round((Date.now() - data.ts) / 60000);
             setText(ageSpan, age < 1 ? T.justNow : (age + T.minutesAgo));
-
+ 
             var cdSpan = mkSpan();
             cdSpan.id              = 'gq-countdown';
             cdSpan.style.fontSize  = '11px';
@@ -513,20 +513,20 @@
             setText(cdSpan, iMins === 0
                 ? T.autoRefOff
                 : T.cdLabel + fmtCountdown(countdownSecs));
-
+ 
             footer.appendChild(ageSpan);
             footer.appendChild(cdSpan);
             w.appendChild(footer);
         }
     }
-
+ 
     /* ══════════════════════════════════════════════
        极简皮肤
        格式：当前用量：68%|01:55|每周限额：11%|5月27日11:55|1 分钟前|XX:XX|按钮
     ══════════════════════════════════════════════ */
     function buildMinimalView(w, state, data, theme) {
         var dark = isDark();
-
+ 
         w.style.position      = 'fixed';
         w.style.bottom        = '20px';
         w.style.right         = '20px';
@@ -549,7 +549,7 @@
         w.style.maxWidth      = 'none';
         w.style.width         = 'auto';
         w.style.height        = 'auto';
-
+ 
         function mkSep() {
             var s = mkSpan();
             s.style.display    = 'inline-block';
@@ -559,7 +559,7 @@
             setText(s, '|');
             return s;
         }
-
+ 
         function mkPiece(txt, color) {
             var s = mkSpan();
             s.style.color       = color || theme.textSub;
@@ -568,33 +568,33 @@
             setText(s, txt);
             return s;
         }
-
+ 
         if (state === 'loading' || state === 'nodata') {
             w.appendChild(mkPiece(state === 'loading' ? T.loading : T.nodata, theme.textSub));
             w.appendChild(mkSep());
             w.appendChild(createActionControls(theme));
             return;
         }
-
+ 
         if (state === 'ok' && data) {
             /* 当前用量：68% */
             w.appendChild(mkPiece(T.current + COL, theme.textSub));
             w.appendChild(mkPiece(data.cu, theme.accent));
             w.appendChild(mkSep());
-
+ 
             /* 01:55 */
             w.appendChild(mkPiece(data.cr, theme.textSub));
             w.appendChild(mkSep());
-
+ 
             /* 每周限额：11% */
             w.appendChild(mkPiece(T.weekly + COL, theme.textSub));
             w.appendChild(mkPiece(data.wu, theme.accent));
             w.appendChild(mkSep());
-
+ 
             /* 5月27日11:55 */
             w.appendChild(mkPiece(data.wr, theme.textSub));
             w.appendChild(mkSep());
-
+ 
             /* 1 分钟前 */
             var ageSpan = mkSpan();
             ageSpan.id              = 'gq-age-text';
@@ -605,7 +605,7 @@
             setText(ageSpan, age < 1 ? T.justNow : (age + T.minutesAgo));
             w.appendChild(ageSpan);
             w.appendChild(mkSep());
-
+ 
             /* XX:XX（倒计时，仅数字） */
             var cdSpan = mkSpan();
             cdSpan.id               = 'gq-countdown-min';
@@ -617,17 +617,17 @@
             w.appendChild(cdSpan);
             w.appendChild(mkSep());
         }
-
+ 
         w.appendChild(createActionControls(theme));
     }
-
+ 
     /* ══════════════════════════════════════════════
        主渲染入口
     ══════════════════════════════════════════════ */
     function render(state, data) {
         _lastState = state;
         _lastData  = data;
-
+ 
         var dark  = isDark();
         var theme = {
             textMain: dark ? '#ffffff'  : '#1c1c1e',
@@ -635,7 +635,7 @@
             accent:   dark ? '#64d2ff'  : '#007aff',
             border:   dark ? '#48484a'  : '#d1d1d6'
         };
-
+ 
         var w = document.getElementById(WIDGET_ID);
         if (!w) {
             w = mkDiv();
@@ -645,14 +645,14 @@
             while (w.firstChild) w.removeChild(w.firstChild);
             w.removeAttribute('style');
         }
-
+ 
         if (getSkinMode() === 'minimal') {
             buildMinimalView(w, state, data, theme);
         } else {
             buildStandardView(w, state, data, theme);
         }
     }
-
+ 
     /* ══════════════════════════════════════════════
        启动
     ══════════════════════════════════════════════ */
@@ -660,17 +660,17 @@
         var cached = getCached(CACHE_KEY);
         render(cached ? 'ok' : 'nodata', cached);
         scheduleNext();
-
+ 
         window.addEventListener('storage', function (e) {
             if (e.key === CACHE_KEY && e.newValue) {
                 try { render('ok', JSON.parse(e.newValue)); } catch (ex) {}
             }
         });
-
+ 
         window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', function () {
             render(getCached(CACHE_KEY) ? 'ok' : 'nodata', getCached(CACHE_KEY));
         });
-
+ 
         // 监听 Gemini body class 变化（dark-theme / light-theme），实时同步插件配色
         var _lastDark = isDark();
         new MutationObserver(function () {
@@ -680,7 +680,7 @@
                 render(_lastState, _lastData);
             }
         }).observe(document.body, { attributes: true, attributeFilter: ['class'] });
-
+ 
         var lastPath = location.pathname;
         new MutationObserver(function () {
             if (location.pathname !== lastPath) {
@@ -690,16 +690,16 @@
                 }
             }
         }).observe(document.body, { childList: true, subtree: true });
-
-        if (!cached) setTimeout(openUsageWindow, 800);
+ 
+        setTimeout(openUsageWindow, 800);
     }
-
+ 
     /* ── 入口 ── */
     if (window.top !== window.self) {
         if (isUsagePage()) runOnUsagePage();
         return;
     }
-
+ 
     if (isUsagePage()) {
         if (document.readyState === 'loading') {
             document.addEventListener('DOMContentLoaded', runOnUsagePage);
@@ -708,11 +708,11 @@
         }
         return;
     }
-
+ 
     if (document.readyState === 'loading') {
         document.addEventListener('DOMContentLoaded', boot);
     } else {
         boot();
     }
-
+ 
 })();
