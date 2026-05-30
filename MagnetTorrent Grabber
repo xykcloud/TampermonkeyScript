@@ -1,0 +1,832 @@
+// ==UserScript==
+// @name         磁力/种子检索器 (Magnet/Torrent Grabber)
+// @namespace    https://greasyfork.org/scripts/magnet-torrent-grabber
+// @version      1.0.0
+// @description  磁力/种子检索器 (Magnet/Torrent Grabber)，https://github.com/xykcloud/TampermonkeyScript
+// @description:en  Dual-engine (DOM attribute scan + TextNode regex) magnet/torrent link grabber with closed Shadow DOM UI, dedup, debounced MutationObserver, drag, minimize, and i18n.
+// @author       xykcloud
+// @match        *://*/*
+// @run-at       document-idle
+// @grant        none
+// @license      GPL v3
+// @noframes
+// ==/UserScript==
+ 
+/*
+ * 架构概述
+ * ─────────────────────────────────────────────────────────────
+ * 1. 抓取层（Scanner）：
+ *    - 引擎 A：扫描 <a> 标签 href，命中 magnet:? 或 .torrent。
+ *    - 引擎 B：createTreeWalker 遍历 TEXT_NODE，用边界截断正则提取。
+ * 2. 数据层（Store）：以"完整 URL"为唯一 Key 的 Map 去重。
+ * 3. 监听层（Observer）：MutationObserver + 800ms 防抖，增量扫描新增子树。
+ * 4. 视图层（UI）：closed Shadow DOM 沙箱，极简黑白灰，按需挂载/卸载。
+ *
+ * 全部使用浏览器原生 API，无任何外部依赖（@grant none）。
+ */
+(function () {
+  'use strict';
+ 
+  /* ============================ 配置区 ============================ */
+  const CONFIG = {
+    DEBOUNCE_MS: 800,        // MutationObserver 防抖间隔
+    NAME_MAX_WIDTH: 180,     // 文件名列最大宽度（px），超出省略
+    PANEL_WIDTH: 360,        // 面板宽度（px）
+    Z_INDEX: 2147483647,     // 顶层 z-index，尽量压过宿主站点
+  };
+ 
+  /*
+   * 磁力链正则（边界截断法）：
+   * 不枚举具体参数，而是用 [^'"\s<>]+ 作为值的字符集，
+   * 在遇到 空格 / 引号 / 尖括号 时自然截断，从而完整保留所有尾部参数。
+   * 结构：magnet:?xt=urn:<类型>:<哈希> (&key=value)*
+   * 注意：值字符集允许 '&'，因此首个 value 可能贪婪吞入后续 &param，
+   *       但这不影响"完整字符串"的捕获（我们仅以完整串为 Key，dn 另行解析）。
+   */
+  const MAGNET_PATTERN =
+    "magnet:\\?xt=urn:[a-z0-9]+:[a-zA-Z0-9]{32,40}(?:&[a-zA-Z0-9.\\-%_]+=[^'\"\\s<>]+)*";
+ 
+  /*
+   * 纯文本种子正则：http(s):// 开头，以 .torrent 结尾。
+   * (?![\\w]) 断言 .torrent 后不再跟单词字符，避免误吞 ".torrentxxx"。
+   * [^\\s'"<>]+ 在空白 / 引号 / 尖括号处截断。
+   */
+  const TORRENT_PATTERN = "https?:\\/\\/[^\\s'\"<>]+\\.torrent(?![\\w])";
+ 
+  /* ============================ 国际化 ============================ */
+  const STR = {
+    zh: {
+      title: '磁力 / 种子 抓取',
+      thIndex: '#',
+      thName: '文件名',
+      thOps: '操作',
+      copy: '复制',
+      copied: '已复制！',
+      copyFail: '复制失败',
+      open: '打开',
+      minimize: '最小化',
+      close: '关闭',
+      expand: '展开（共 {n} 个）',
+      langBtn: 'EN',
+      magnetLink: '磁力链接{n}',
+      unknownTorrent: '未知名称',
+    },
+    en: {
+      title: 'Magnet / Torrent',
+      thIndex: '#',
+      thName: 'File name',
+      thOps: 'Actions',
+      copy: 'Copy',
+      copied: 'Copied!',
+      copyFail: 'Copy failed',
+      open: 'Open',
+      minimize: 'Minimize',
+      close: 'Close',
+      expand: 'Expand ({n})',
+      langBtn: '中',
+      magnetLink: 'Magnet link {n}',
+      unknownTorrent: 'Unknown',
+    },
+  };
+ 
+  /*
+   * 语言探测：读取 navigator.language / languages，
+   * 以 'zh' 开头视为中文，其余英文；读取失败默认中文。
+   */
+  function detectLang() {
+    try {
+      const raw =
+        (navigator.language ||
+          (navigator.languages && navigator.languages[0]) ||
+          '').toLowerCase();
+      if (!raw) return 'zh';
+      return raw.indexOf('zh') === 0 ? 'zh' : 'en';
+    } catch (e) {
+      return 'zh';
+    }
+  }
+ 
+  let curLang = detectLang();
+ 
+  // 文案取词，支持 {n} 占位符替换。
+  function T(key, vars) {
+    let s = (STR[curLang] && STR[curLang][key]) || key;
+    if (vars) {
+      Object.keys(vars).forEach((k) => {
+        s = s.replace('{' + k + '}', vars[k]);
+      });
+    }
+    return s;
+  }
+ 
+  /* ============================ 数据层 ============================ */
+  // key: 完整 URL 字符串 -> { url, name:string|null, type:'magnet'|'torrent', seq:number|null }
+  const store = new Map();
+  let magnetSeq = 0; // 无名磁力的自增序号（用于"磁力链接X"）
+ 
+  /*
+   * 入库（去重）：以完整 URL 为唯一 Key。
+   * name 允许为 null —— 真实文件名在入库时确定，回退文案延迟到渲染时
+   * 按当前语言生成，从而保证切换语言时回退名称也能正确翻译。
+   * 无名磁力在入库时分配一个稳定序号 seq。
+   * 返回 true 表示确实新增了一条（用于判断是否需要刷新 UI）。
+   */
+  function addItem(url, name, type) {
+    if (!url) return false;
+    if (store.has(url)) return false;
+    const clean = name ? String(name).trim() : '';
+    const seq = type === 'magnet' && !clean ? ++magnetSeq : null;
+    store.set(url, {
+      url: url,
+      name: clean || null,
+      type: type,
+      seq: seq,
+    });
+    return true;
+  }
+ 
+  /* ----------------------- 文件名解析工具 ----------------------- */
+ 
+  /*
+   * 从磁力链的 dn= 参数解码文件名。
+   * 先把 '+' 还原为空格，再 decodeURIComponent；解码异常则回退原值。
+   */
+  function magnetNameFromDn(magnet) {
+    const m = magnet.match(/[?&]dn=([^&]+)/i);
+    if (!m || !m[1]) return null;
+    try {
+      return decodeURIComponent(m[1].replace(/\+/g, ' ')).trim() || null;
+    } catch (e) {
+      return m[1];
+    }
+  }
+ 
+  // 从 URL 路径中取末段作为文件名（用于种子）。
+  function basenameFromUrl(url) {
+    try {
+      const u = new URL(url, location.href);
+      const seg = u.pathname.split('/').filter(Boolean).pop() || '';
+      return decodeURIComponent(seg).trim() || null;
+    } catch (e) {
+      const seg = url.split(/[?#]/)[0].split('/').pop() || '';
+      return seg.trim() || null;
+    }
+  }
+ 
+  /*
+   * 提取 <a> 标签中"有意义的可见文本"作为文件名候选：
+   * 折叠空白；若为空、或文本本身就是链接（等于 url / magnet: / http 开头），则视为无效。
+   */
+  function meaningfulAnchorText(a, url) {
+    let txt = (a.textContent || '').replace(/\s+/g, ' ').trim();
+    if (!txt) return null;
+    if (txt === url) return null;
+    if (/^magnet:\?/i.test(txt)) return null;
+    if (/^https?:\/\//i.test(txt)) return null;
+    return txt;
+  }
+ 
+  /*
+   * 渲染时解析显示名：
+   *   - 有真实 name 直接用；
+   *   - 无名磁力 -> "磁力链接X"（X 为稳定序号）；
+   *   - 无名种子 -> "未知名称"。
+   * 回退文案按当前语言生成，切换语言即时生效。
+   */
+  function resolveDisplayName(item) {
+    if (item.name) return item.name;
+    if (item.type === 'magnet') return T('magnetLink', { n: item.seq });
+    return T('unknownTorrent');
+  }
+ 
+  /* ============================ 抓取层 ============================ */
+ 
+  /*
+   * 在一段纯文本中提取磁力链与种子链接。
+   * 每次新建 RegExp（带 g 标志）以避免 lastIndex 跨调用污染。
+   * 返回是否有新增入库。
+   */
+  function scanText(text) {
+    if (!text) return false;
+    let changed = false;
+ 
+    // 引擎 B - 磁力
+    const magnetRe = new RegExp(MAGNET_PATTERN, 'gi');
+    let m;
+    while ((m = magnetRe.exec(text)) !== null) {
+      const url = m[0];
+      changed = addItem(url, magnetNameFromDn(url), 'magnet') || changed;
+      // 防止潜在的零宽匹配造成死循环（理论上本正则不会，但作为防御）。
+      if (m.index === magnetRe.lastIndex) magnetRe.lastIndex++;
+    }
+ 
+    // 引擎 B - 种子
+    const torrentRe = new RegExp(TORRENT_PATTERN, 'gi');
+    while ((m = torrentRe.exec(text)) !== null) {
+      const url = m[0];
+      changed = addItem(url, basenameFromUrl(url), 'torrent') || changed;
+      if (m.index === torrentRe.lastIndex) torrentRe.lastIndex++;
+    }
+    return changed;
+  }
+ 
+  /*
+   * 引擎 A：扫描给定根元素下（含自身）的所有 <a> 标签。
+   * 命中规则：href 以 magnet:? 开头，或 href 包含 .torrent。
+   */
+  function scanAnchors(rootEl) {
+    if (!rootEl || rootEl.nodeType !== Node.ELEMENT_NODE) return false;
+    let changed = false;
+ 
+    const anchors = [];
+    if (rootEl.tagName === 'A') anchors.push(rootEl);
+    if (rootEl.querySelectorAll) {
+      rootEl.querySelectorAll('a').forEach((a) => anchors.push(a));
+    }
+ 
+    for (let i = 0; i < anchors.length; i++) {
+      const a = anchors[i];
+      // 取原始属性以保留磁力链原貌；取 .href 以获得绝对化的种子 URL。
+      const raw = (a.getAttribute('href') || '').trim();
+      const abs = a.href || '';
+ 
+      if (/^magnet:\?/i.test(raw)) {
+        // 用磁力正则规范化截取，确保拿到结构完整的磁力串。
+        const re = new RegExp(MAGNET_PATTERN, 'i');
+        const mm = raw.match(re);
+        const url = mm ? mm[0] : raw;
+        // 命名优先级：<a> 可见文本 > dn 参数 >（入库后回退"磁力链接X"）
+        const name = meaningfulAnchorText(a, url) || magnetNameFromDn(url);
+        changed = addItem(url, name, 'magnet') || changed;
+      } else if (raw.indexOf('.torrent') !== -1 || abs.indexOf('.torrent') !== -1) {
+        const url = abs || raw;
+        // 命名优先级：<a> 可见文本 > URL 末段
+        const name = meaningfulAnchorText(a, url) || basenameFromUrl(url);
+        changed = addItem(url, name, 'torrent') || changed;
+      }
+    }
+    return changed;
+  }
+ 
+  /*
+   * 引擎 B 入口：用 TreeWalker 遍历根元素下的 TEXT_NODE。
+   * acceptNode 过滤：
+   *   - 跳过 script / style / noscript / textarea；
+   *   - 跳过脚本自身 UI 宿主子树；
+   *   - 快速预筛：文本不含 'magnet:' 或 '.torrent' 直接拒绝，避免无谓正则开销。
+   */
+  function scanTextSubtree(rootEl) {
+    if (!rootEl || rootEl.nodeType !== Node.ELEMENT_NODE) return false;
+    let changed = false;
+ 
+    const walker = document.createTreeWalker(rootEl, NodeFilter.SHOW_TEXT, {
+      acceptNode: function (node) {
+        const p = node.parentNode;
+        if (!p) return NodeFilter.FILTER_REJECT;
+        const tag = p.nodeName;
+        if (tag === 'SCRIPT' || tag === 'STYLE' || tag === 'NOSCRIPT' || tag === 'TEXTAREA') {
+          return NodeFilter.FILTER_REJECT;
+        }
+        if (hostEl && hostEl.contains(p)) return NodeFilter.FILTER_REJECT;
+        const v = node.nodeValue;
+        if (!v || (v.indexOf('magnet:') === -1 && v.indexOf('.torrent') === -1)) {
+          return NodeFilter.FILTER_REJECT;
+        }
+        return NodeFilter.FILTER_ACCEPT;
+      },
+    });
+ 
+    let n;
+    while ((n = walker.nextNode())) {
+      changed = scanText(n.nodeValue) || changed;
+    }
+    return changed;
+  }
+ 
+  /*
+   * 统一节点分发：
+   *   - TEXT_NODE：直接对其文本跑正则；
+   *   - ELEMENT_NODE：跑引擎 A（锚点）+ 引擎 B（子树文本）；
+   *   - 跳过脚本自身宿主元素。
+   */
+  function scanNode(node) {
+    if (!node) return false;
+    if (node === hostEl) return false;
+ 
+    if (node.nodeType === Node.TEXT_NODE) {
+      return scanText(node.nodeValue);
+    }
+    if (node.nodeType !== Node.ELEMENT_NODE) return false;
+ 
+    let changed = false;
+    changed = scanAnchors(node) || changed;
+    changed = scanTextSubtree(node) || changed;
+    return changed;
+  }
+ 
+  /* ============================ 监听层 ============================ */
+  let observer = null;
+  let debounceTimer = null;
+  let pendingNodes = [];
+ 
+  /*
+   * 去除互为父子的冗余节点：若某节点是列表中另一节点的后代，则剔除，
+   * 避免对同一子树重复扫描。
+   */
+  function dedupeNodes(nodes) {
+    const result = [];
+    for (let i = 0; i < nodes.length; i++) {
+      const a = nodes[i];
+      if (!a) continue;
+      let covered = false;
+      for (let j = 0; j < nodes.length; j++) {
+        if (i === j) continue;
+        const b = nodes[j];
+        if (b && b.nodeType === Node.ELEMENT_NODE && b.contains && b.contains(a) && b !== a) {
+          covered = true;
+          break;
+        }
+      }
+      if (!covered && result.indexOf(a) === -1) result.push(a);
+    }
+    return result;
+  }
+ 
+  // 收集待扫描节点并防抖；800ms 静默后只扫描新增子树。
+  function scheduleScan(nodes) {
+    for (let i = 0; i < nodes.length; i++) pendingNodes.push(nodes[i]);
+    if (debounceTimer) clearTimeout(debounceTimer);
+    debounceTimer = setTimeout(function () {
+      const batch = dedupeNodes(pendingNodes);
+      pendingNodes = [];
+      let changed = false;
+      for (let i = 0; i < batch.length; i++) {
+        try {
+          changed = scanNode(batch[i]) || changed;
+        } catch (e) {
+          /* 单节点扫描异常不应中断整体流程 */
+        }
+      }
+      if (changed) refresh();
+    }, CONFIG.DEBOUNCE_MS);
+  }
+ 
+  function startObserver() {
+    if (observer) return;
+    observer = new MutationObserver(function (records) {
+      const added = [];
+      for (let i = 0; i < records.length; i++) {
+        const r = records[i];
+        if (r.type === 'childList') {
+          for (let k = 0; k < r.addedNodes.length; k++) {
+            const node = r.addedNodes[k];
+            // 忽略脚本自身 UI 宿主的插入/移除，防止自我触发循环。
+            if (node === hostEl) continue;
+            added.push(node);
+          }
+        } else if (r.type === 'characterData') {
+          if (r.target) added.push(r.target);
+        }
+      }
+      if (added.length) scheduleScan(added);
+    });
+    observer.observe(document.documentElement, {
+      childList: true,
+      subtree: true,
+      characterData: true,
+    });
+  }
+ 
+  /* ============================ 视图层 ============================ */
+  let hostEl = null;   // 挂载到 light DOM 的宿主元素
+  let shadow = null;   // closed shadow root（自存引用，因 closed 模式外部取不到）
+  const ui = {};       // 缓存内部关键节点引用
+ 
+  // UI 会话状态（刷新页面即重置，不做持久化）。
+  const state = {
+    minimized: false,
+    closed: false,
+    closedCount: 0,    // 关闭时的条目数快照，用于"发现更多新链接才重新出现"
+    dragging: false,
+    dragOffsetX: 0,
+    dragOffsetY: 0,
+  };
+ 
+  // 构建 <style>，所有样式被 closed shadow 封装，杜绝宿主 CSS 污染。
+  function buildStyle() {
+    const style = document.createElement('style');
+    style.textContent = [
+      '*{box-sizing:border-box;margin:0;padding:0;',
+      'font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,"PingFang SC","Microsoft YaHei",sans-serif;}',
+      '.panel{position:fixed;right:20px;bottom:20px;width:' + CONFIG.PANEL_WIDTH + 'px;max-height:60vh;',
+      'display:flex;flex-direction:column;background:#FFFFFF;color:#333333;',
+      'border:1px solid #E0E0E0;border-radius:4px;box-shadow:0 2px 8px rgba(0,0,0,0.12);',
+      'z-index:' + CONFIG.Z_INDEX + ';font-size:13px;line-height:1.4;overflow:hidden;}',
+ 
+      '.header{display:flex;align-items:center;justify-content:space-between;',
+      'padding:8px 10px;border-bottom:1px solid #E0E0E0;background:#FFFFFF;cursor:move;user-select:none;}',
+      '.title{font-size:13px;font-weight:600;color:#333333;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}',
+      '.h-actions{display:flex;align-items:center;gap:4px;flex-shrink:0;margin-left:8px;}',
+ 
+      '.btn{font-size:12px;color:#333333;background:#FFFFFF;border:1px solid #E0E0E0;',
+      'border-radius:2px;padding:2px 6px;cursor:pointer;line-height:1.4;}',
+      '.btn:hover{background:#F5F5F5;}',
+      '.icon-btn{width:22px;height:22px;display:inline-flex;align-items:center;justify-content:center;padding:0;font-size:14px;}',
+ 
+      '.body{overflow:auto;flex:1;}',
+      'table{width:100%;border-collapse:collapse;}',
+      'thead th{position:sticky;top:0;background:#FFFFFF;color:#333333;font-weight:600;',
+      'text-align:left;padding:6px 8px;border-bottom:1px solid #E0E0E0;font-size:12px;}',
+      'tbody td{padding:6px 8px;border-bottom:1px solid #F0F0F0;vertical-align:middle;color:#333333;}',
+      'tbody tr:hover{background:#FAFAFA;}',
+      '.col-idx{width:32px;color:#999999;text-align:right;}',
+      '.col-name{max-width:' + CONFIG.NAME_MAX_WIDTH + 'px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}',
+      '.col-ops{width:96px;white-space:nowrap;text-align:right;}',
+      '.col-ops .btn{margin-left:4px;}',
+      '.tag{display:inline-block;font-size:10px;color:#999999;border:1px solid #E0E0E0;',
+      'border-radius:2px;padding:0 3px;margin-right:4px;}',
+ 
+      '.fab{position:fixed;right:20px;bottom:20px;background:#FFFFFF;color:#333333;',
+      'border:1px solid #E0E0E0;border-radius:4px;padding:6px 12px;font-size:13px;cursor:pointer;',
+      'box-shadow:0 2px 8px rgba(0,0,0,0.12);z-index:' + CONFIG.Z_INDEX + ';user-select:none;}',
+      '.fab:hover{background:#F5F5F5;}',
+      '.hidden{display:none !important;}',
+    ].join('');
+    return style;
+  }
+ 
+  /*
+   * 构建 UI 骨架（仅一次）：面板 + 最小化悬浮按钮。
+   * 内容由 render() 按当前语言与数据动态填充。
+   */
+  function buildSkeleton() {
+    const root = document.createElement('div');
+ 
+    // ---- 面板 ----
+    const panel = document.createElement('div');
+    panel.className = 'panel';
+ 
+    const header = document.createElement('div');
+    header.className = 'header';
+ 
+    const title = document.createElement('div');
+    title.className = 'title';
+ 
+    const hActions = document.createElement('div');
+    hActions.className = 'h-actions';
+ 
+    const langBtn = document.createElement('button');
+    langBtn.className = 'btn';
+    langBtn.addEventListener('click', function (e) {
+      e.stopPropagation();
+      curLang = curLang === 'zh' ? 'en' : 'zh';
+      render();
+    });
+ 
+    const minBtn = document.createElement('button');
+    minBtn.className = 'btn icon-btn';
+    minBtn.textContent = '—';
+    minBtn.addEventListener('click', function (e) {
+      e.stopPropagation();
+      state.minimized = true;
+      render();
+    });
+ 
+    const closeBtn = document.createElement('button');
+    closeBtn.className = 'btn icon-btn';
+    closeBtn.textContent = '×';
+    closeBtn.addEventListener('click', function (e) {
+      e.stopPropagation();
+      state.closed = true;
+      state.closedCount = store.size;
+      removeUI();
+    });
+ 
+    hActions.appendChild(langBtn);
+    hActions.appendChild(minBtn);
+    hActions.appendChild(closeBtn);
+    header.appendChild(title);
+    header.appendChild(hActions);
+ 
+    // 拖拽：仅以 header 作为把手，按钮上的 mousedown 不触发拖拽。
+    header.addEventListener('mousedown', onDragStart);
+ 
+    const body = document.createElement('div');
+    body.className = 'body';
+    const table = document.createElement('table');
+    const thead = document.createElement('thead');
+    const headRow = document.createElement('tr');
+    const thIdx = document.createElement('th');
+    thIdx.className = 'col-idx';
+    const thName = document.createElement('th');
+    const thOps = document.createElement('th');
+    thOps.className = 'col-ops';
+    headRow.appendChild(thIdx);
+    headRow.appendChild(thName);
+    headRow.appendChild(thOps);
+    thead.appendChild(headRow);
+    const tbody = document.createElement('tbody');
+    table.appendChild(thead);
+    table.appendChild(tbody);
+    body.appendChild(table);
+ 
+    panel.appendChild(header);
+    panel.appendChild(body);
+ 
+    // ---- 最小化悬浮按钮 ----
+    const fab = document.createElement('div');
+    fab.className = 'fab hidden';
+    fab.addEventListener('click', function () {
+      state.minimized = false;
+      render();
+    });
+ 
+    root.appendChild(panel);
+    root.appendChild(fab);
+ 
+    // 缓存引用
+    ui.root = root;
+    ui.panel = panel;
+    ui.title = title;
+    ui.langBtn = langBtn;
+    ui.minBtn = minBtn;
+    ui.closeBtn = closeBtn;
+    ui.thIdx = thIdx;
+    ui.thName = thName;
+    ui.thOps = thOps;
+    ui.tbody = tbody;
+    ui.fab = fab;
+ 
+    return root;
+  }
+ 
+  // 确保 UI 已挂载；若已存在则复用（保留拖拽位置与会话状态）。
+  function ensureUI() {
+    if (hostEl && hostEl.isConnected) return;
+    hostEl = document.createElement('div');
+    hostEl.setAttribute('data-mtg-host', '1');
+    // 防止宿主页面样式影响宿主元素本身。
+    hostEl.style.all = 'initial';
+    // closed 模式：外部（含宿主页面脚本）无法通过 element.shadowRoot 访问内部。
+    shadow = hostEl.attachShadow({ mode: 'closed' });
+    shadow.appendChild(buildStyle());
+    shadow.appendChild(buildSkeleton());
+    (document.body || document.documentElement).appendChild(hostEl);
+  }
+ 
+  // 彻底卸载 UI（结果为空或用户关闭时调用），不在后台驻留 DOM。
+  function removeUI() {
+    if (hostEl && hostEl.parentNode) hostEl.parentNode.removeChild(hostEl);
+    hostEl = null;
+    shadow = null;
+    // 清空引用缓存
+    Object.keys(ui).forEach((k) => delete ui[k]);
+  }
+ 
+  /* ----------------------- 交互：拖拽 ----------------------- */
+ 
+  function onDragStart(e) {
+    // 点在按钮上时不拖拽。
+    if (e.target && e.target.closest && e.target.closest('.btn')) return;
+    if (!ui.panel) return;
+    state.dragging = true;
+    const rect = ui.panel.getBoundingClientRect();
+    state.dragOffsetX = e.clientX - rect.left;
+    state.dragOffsetY = e.clientY - rect.top;
+    // 切换为以 left/top 定位，解除 right/bottom 约束。
+    ui.panel.style.left = rect.left + 'px';
+    ui.panel.style.top = rect.top + 'px';
+    ui.panel.style.right = 'auto';
+    ui.panel.style.bottom = 'auto';
+    document.addEventListener('mousemove', onDragMove, true);
+    document.addEventListener('mouseup', onDragEnd, true);
+    e.preventDefault();
+  }
+ 
+  function onDragMove(e) {
+    if (!state.dragging || !ui.panel) return;
+    let x = e.clientX - state.dragOffsetX;
+    let y = e.clientY - state.dragOffsetY;
+    // 约束在视口内（留出余量，避免拖出屏幕无法找回）。
+    const w = ui.panel.offsetWidth;
+    const h = ui.panel.offsetHeight;
+    const maxX = window.innerWidth - w;
+    const maxY = window.innerHeight - h;
+    x = Math.max(0, Math.min(x, Math.max(0, maxX)));
+    y = Math.max(0, Math.min(y, Math.max(0, maxY)));
+    ui.panel.style.left = x + 'px';
+    ui.panel.style.top = y + 'px';
+  }
+ 
+  function onDragEnd() {
+    state.dragging = false;
+    document.removeEventListener('mousemove', onDragMove, true);
+    document.removeEventListener('mouseup', onDragEnd, true);
+  }
+ 
+  /* ----------------------- 交互：复制 / 打开 ----------------------- */
+ 
+  /*
+   * 复制：优先 navigator.clipboard.writeText；
+   * 失败则回退到临时 textarea + execCommand('copy')。
+   * 按钮文本短暂变为"已复制！"后还原。
+   */
+  function copyToClipboard(text, btn) {
+    const original = btn.textContent;
+ 
+    function feedback(ok) {
+      btn.textContent = ok ? T('copied') : T('copyFail');
+      setTimeout(function () {
+        btn.textContent = original;
+      }, 1200);
+    }
+ 
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(
+          function () { feedback(true); },
+          function () { feedback(fallbackCopy(text)); }
+        );
+        return;
+      }
+      throw new Error('clipboard api unavailable');
+    } catch (e) {
+      feedback(fallbackCopy(text));
+    }
+  }
+ 
+  // 兼容性回退复制方案。
+  function fallbackCopy(text) {
+    let ta = null;
+    try {
+      ta = document.createElement('textarea');
+      ta.value = text;
+      ta.setAttribute('readonly', '');
+      ta.style.position = 'fixed';
+      ta.style.top = '-9999px';
+      ta.style.left = '-9999px';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.focus();
+      ta.select();
+      ta.setSelectionRange(0, ta.value.length);
+      const ok = document.execCommand('copy');
+      return !!ok;
+    } catch (e) {
+      return false;
+    } finally {
+      if (ta && ta.parentNode) ta.parentNode.removeChild(ta);
+    }
+  }
+ 
+  /*
+   * 打开链接：
+   *   - 磁力链：通过临时 <a> 点击触发系统协议处理（window.open 对 magnet 常无效）；
+   *   - 种子 URL：window.open 新标签。
+   */
+  function openLink(url) {
+    try {
+      if (/^magnet:/i.test(url)) {
+        const a = document.createElement('a');
+        a.href = url;
+        a.style.display = 'none';
+        document.body.appendChild(a);
+        a.click();
+        a.parentNode.removeChild(a);
+      } else {
+        window.open(url, '_blank', 'noopener');
+      }
+    } catch (e) {
+      // 兜底：直接跳转当前页（极少触发）。
+      try { window.location.href = url; } catch (_) {}
+    }
+  }
+ 
+  /* ----------------------- 渲染 ----------------------- */
+ 
+  // 渲染最小化视图（隐藏面板，显示"展开（共 X 个）"悬浮按钮）。
+  function renderMinimized(count) {
+    if (!ui.panel || !ui.fab) return;
+    ui.panel.classList.add('hidden');
+    ui.fab.classList.remove('hidden');
+    ui.fab.textContent = T('expand', { n: count });
+  }
+ 
+  // 渲染完整面板（表头 + 数据行）。
+  function renderPanel(items) {
+    if (!ui.panel) return;
+    ui.fab.classList.add('hidden');
+    ui.panel.classList.remove('hidden');
+ 
+    // 头部文案
+    ui.title.textContent = T('title') + ' · ' + items.length;
+    ui.langBtn.textContent = T('langBtn');
+    ui.minBtn.title = T('minimize');
+    ui.closeBtn.title = T('close');
+    ui.thIdx.textContent = T('thIndex');
+    ui.thName.textContent = T('thName');
+    ui.thOps.textContent = T('thOps');
+ 
+    // 重建表体
+    const tbody = ui.tbody;
+    tbody.textContent = '';
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i];
+      const tr = document.createElement('tr');
+ 
+      const tdIdx = document.createElement('td');
+      tdIdx.className = 'col-idx';
+      tdIdx.textContent = String(i + 1);
+ 
+      const tdName = document.createElement('td');
+      tdName.className = 'col-name';
+      // 类型小标签（magnet / torrent）+ 文件名
+      const tag = document.createElement('span');
+      tag.className = 'tag';
+      tag.textContent = item.type === 'magnet' ? 'M' : 'T';
+      const displayName = resolveDisplayName(item);
+      const nameText = document.createElement('span');
+      nameText.textContent = displayName;
+      tdName.appendChild(tag);
+      tdName.appendChild(nameText);
+      // 超出省略时提供完整名称 + URL 的悬浮提示。
+      tdName.title = displayName + '\n' + item.url;
+ 
+      const tdOps = document.createElement('td');
+      tdOps.className = 'col-ops';
+      const copyBtn = document.createElement('button');
+      copyBtn.className = 'btn';
+      copyBtn.textContent = T('copy');
+      copyBtn.addEventListener('click', function () {
+        copyToClipboard(item.url, copyBtn);
+      });
+      const openBtn = document.createElement('button');
+      openBtn.className = 'btn';
+      openBtn.textContent = T('open');
+      openBtn.addEventListener('click', function () {
+        openLink(item.url);
+      });
+      tdOps.appendChild(copyBtn);
+      tdOps.appendChild(openBtn);
+ 
+      tr.appendChild(tdIdx);
+      tr.appendChild(tdName);
+      tr.appendChild(tdOps);
+      tbody.appendChild(tr);
+    }
+  }
+ 
+  // 渲染调度：依据数据与状态决定挂载 / 卸载 / 面板 / 最小化。
+  function render() {
+    const items = Array.from(store.values());
+ 
+    // 结果为空：彻底隐藏（卸载 DOM）。
+    if (items.length === 0) {
+      removeUI();
+      return;
+    }
+ 
+    // 用户已关闭：仅当发现"更多新链接"时才重新出现。
+    if (state.closed) {
+      if (items.length > state.closedCount) {
+        state.closed = false;
+      } else {
+        return;
+      }
+    }
+ 
+    ensureUI();
+    if (state.minimized) {
+      renderMinimized(items.length);
+    } else {
+      renderPanel(items);
+    }
+  }
+ 
+  // 对外统一的"刷新"入口。
+  function refresh() {
+    render();
+  }
+ 
+  /* ============================ 启动 ============================ */
+  function bootstrap() {
+    try {
+      const root = document.body || document.documentElement;
+      if (root) {
+        scanAnchors(root);     // 引擎 A 首次全量
+        scanTextSubtree(root); // 引擎 B 首次全量
+      }
+    } catch (e) {
+      /* 首次扫描异常不应阻断后续监听 */
+    }
+    refresh();      // 按需挂载 UI
+    startObserver(); // 启动动态监听
+  }
+ 
+  // @run-at document-idle 下 body 通常已就绪；仍做一次兜底等待。
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', bootstrap, { once: true });
+  } else {
+    bootstrap();
+  }
+})();
