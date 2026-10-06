@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         谷歌相册自动保存助手/Google Photos AutoSave Assistant
 // @namespace    http://tampermonkey.net/
-// @version      1.1
+// @version      1.2
 // @description  谷歌相册自动保存助手/Google Photos AutoSave Assistant，https://github.com/xykcloud/TampermonkeyScript
 // @author       xykcloud
 // @match        *://photos.google.com/*
@@ -28,6 +28,7 @@
     var SETTINGS_KEY = 'gp_settings_v1';
     var LAST_RESULT_KEY = 'gp_last_res_v1';
     var ANCHOR_KEY = 'gp_resume_anchor_v1'; // 全量·文件粒度：边界日内的精确续传锚点
+    var REWIND_KEY = 'gp_rewind_v1';        // 差异模式补扫回退的上一次位置，防止同一位置反复回退
 
     (function migrateOldData() {
         var current = localStorage.getItem(STORAGE_KEY);
@@ -57,6 +58,7 @@
         SCROLL_WAIT: 150,
         MAX_RETRY: 250,
         SAVE_TIMEOUT: 120,
+        LOAD_TIMEOUT: 8000,      // 稳扫：单屏等待照片加载完成的最长时间 (ms)
         FIXED_TODAY: ""
     };
 
@@ -82,7 +84,13 @@
     function strategyLabel() {
         return (isDiffMode() ? '差异保存' : '全量保存') + ' · ' + (isFileGranularity() ? '文件粒度' : '日期粒度');
     }
+    function loadTimeout() { return CONFIG.LOAD_TIMEOUT > 0 ? CONFIG.LOAD_TIMEOUT : 8000; }
     function fmtDate(d) { return d.getFullYear() + '.' + (d.getMonth() + 1) + '.' + d.getDate(); }
+    function parseYMD(s) {
+        var a = String(s || '').split('.');
+        return a.length === 3 ? new Date(parseInt(a[0]), parseInt(a[1]) - 1, parseInt(a[2])) : null;
+    }
+    function ymdTime(s) { var d = parseYMD(s); return d ? d.getTime() : NaN; }
     function sleep(ms) { return new Promise(function(r) { setTimeout(r, ms); }); }
     function loadAnchor() {
         try { return JSON.parse(localStorage.getItem(ANCHOR_KEY) || 'null'); } catch (e) { return null; }
@@ -203,7 +211,8 @@
             {label: '操作速度', key: 'ACTION_SPEED', w:'48%'},
             {label: '翻页间隔', key: 'SCROLL_WAIT', w:'48%'},
             {label: '保存超时', key: 'SAVE_TIMEOUT', w:'48%'},
-            {label: '日期校准', key: 'FIXED_TODAY', w:'48%'}
+            {label: '日期校准', key: 'FIXED_TODAY', w:'48%'},
+            {label: '加载超时', key: 'LOAD_TIMEOUT', w:'48%'}
         ];
 
         fields.forEach(function(f) {
@@ -401,6 +410,73 @@
         logContainer.scrollTop = logContainer.scrollHeight;
     }
 
+    // --- 稳扫引擎：几何判定 / 加载判定 / 可靠点击 / 步进翻页 ---
+    function rectOf(el) {
+        var r = el.getBoundingClientRect();
+        return (r.width > 0 && r.height > 0) ? r : null;
+    }
+    // 完整处于视口内
+    function isFullyVisible(r) { return r.top >= -2 && r.bottom <= window.innerHeight + 2; }
+    // 已翻过或正完整处于视口内（视口下方、尚未完整露出的不算）
+    function isReached(r) { return r.bottom <= window.innerHeight + 2; }
+    // 缩略图数据已到位（内联 background-image；无图模式只是用 CSS 盖住，不影响这里的判断）
+    function hasThumb(p) {
+        var t = p.querySelector('.RY3tic');
+        var st = t ? (t.getAttribute('style') || '') : '';
+        return st.indexOf('url(') !== -1;
+    }
+    // 轻推一次，让虚拟列表重新计算可见区并补齐渲染（不改变滚动位置）
+    function nudgeRender() {
+        try { window.dispatchEvent(new Event('resize')); } catch (e) {}
+        try { window.dispatchEvent(new Event('scroll')); document.dispatchEvent(new Event('scroll')); } catch (e) {}
+    }
+    function contentSignature() {
+        var tiles = document.querySelectorAll('.rtIMgb');
+        var last = tiles[tiles.length - 1];
+        var a = last ? last.querySelector('a.p137Zd') : null;
+        return tiles.length + '|' + (a ? a.getAttribute('href') : '') + '|' + document.querySelectorAll('h2.ZEmz6b').length;
+    }
+    // 步进翻页：把第一个"未完整露出"的元素滚到视口顶部，保证每个格子都会完整出现在视口里至少一次，
+    // 不再像原来那样一下跳到 DOM 最后一个元素（会把预渲染但还没加载完的几行直接甩过去）
+    async function stepScroll() {
+        var vh = window.innerHeight;
+        var els = document.querySelectorAll('.rtIMgb, h2.ZEmz6b');
+        var next = null, nextTop = Infinity, lastEl = null, lastBottom = -Infinity;
+        for (var i = 0; i < els.length; i++) {
+            var r = rectOf(els[i]);
+            if (!r) continue;
+            if (r.bottom > lastBottom) { lastBottom = r.bottom; lastEl = els[i]; }
+            if (r.bottom > vh + 2 && r.top < nextTop) { nextTop = r.top; next = els[i]; }
+        }
+        var target = next || lastEl;
+        if (!target) return false;
+        var block = (next && nextTop <= 5) ? 'end' : 'start';
+        var before = target.getBoundingClientRect().top;
+        target.scrollIntoView({ behavior: 'auto', block: block });
+        await sleep(30);
+        if (!target.isConnected) return true;
+        return (before - target.getBoundingClientRect().top) > 2;
+    }
+    // 点击复选框并确认生效：aria-checked 变为 true 或"已选择"计数增加才算成功；未生效最多补点 2 次
+    async function clickAndVerify(cb) {
+        var baseWait = Math.max(30, CONFIG.ACTION_SPEED || 0);
+        for (var attempt = 0; attempt < 3; attempt++) {
+            if (!cb.isConnected) return 'detached';
+            if (cb.getAttribute('aria-checked') === 'true') return 'ok';
+            var before = getCount();
+            ['mouseover', 'mousedown', 'mouseup', 'click'].forEach(function(t) {
+                cb.dispatchEvent(new MouseEvent(t, {bubbles: true}));
+            });
+            await sleep(baseWait);
+            for (var waited = 0; waited <= 800; waited += 50) {
+                if (getCount() > before || cb.getAttribute('aria-checked') === 'true') return 'ok';
+                if (!cb.isConnected) return 'detached';
+                await sleep(50);
+            }
+        }
+        return 'fail';
+    }
+
     // 【核心引擎：逆向视点追踪与双重指纹校验】
     async function findElementWithScroll(nodeData) {
         var cbTarget = null;
@@ -450,6 +526,7 @@
         var diskSaved = localStorage.getItem(STORAGE_KEY) || "";
         var baseDate, isInfiniteTarget = false;
 
+        // 已勾选节点，按日期从新到旧排列：栈顶 = 最旧的已勾选项（回退时先撤最旧的，进度取栈顶）
         var checkedNodesStack = [];
 
         // 全量·文件粒度的续传锚点：上一批最后保存的那张照片。
@@ -481,15 +558,198 @@
         var lastList = "", retry = 0;
         var loggedScans = {};
 
-        // 回退后以栈顶（最后一个仍处于勾选状态的节点）作为本批进度，防止被撤销的照片在下次运行时被跳过
+        // 稳扫状态
+        var clickFails = {};      // key -> 点击未生效的轮数
+        var givenUp = {};         // key -> true：多次点击无效、已放弃的项
+        var notedMissed = {};     // key -> true：已计入遗漏，避免重复计数
+        var missed = { count: 0, newest: null };   // 本批始终未能勾选的照片
+        var labelSampleLogged = false;
+
+        // 进度 = 栈顶（最旧的、仍处于勾选状态的节点）
         function syncProgressFromStack() {
             var top = checkedNodesStack[checkedNodesStack.length - 1];
             tempLastDate = top ? fmtDate(top.dObj) : diskSaved;
         }
+        // 按日期有序插入（同日期按处理顺序追加），保证补点的照片不会打乱回退顺序
+        function pushNode(node) {
+            var i = checkedNodesStack.length;
+            while (i > 0 && checkedNodesStack[i - 1].dObj.getTime() < node.dObj.getTime()) i--;
+            checkedNodesStack.splice(i, 0, node);
+            syncProgressFromStack();
+        }
+        function noteMissedOnce(key, dObj) {
+            if (dObj && dObj.getTime() > targetTS) return;   // 超出范围的本来就不处理
+            if (key) { if (notedMissed[key]) return; notedMissed[key] = true; }
+            missed.count++;
+            if (dObj && (!missed.newest || dObj.getTime() > missed.newest.getTime())) missed.newest = dObj;
+        }
+
+        // ---- 文件粒度单轮扫描：只处理已翻过/完整可见的照片；完整可见但未加载完的计入 pending ----
+        async function processFilePass(force) {
+            var st = { total: 0, saved: 0, future: 0, clicked: 0, resumed: 0, pending: 0, guessed: 0, lastLabel: "", pendingSample: "", stop: false, full: false };
+            var els = document.querySelectorAll('h2.ZEmz6b, .rtIMgb');
+            var headerDate = null;
+
+            for (var i = 0; i < els.length; i++) {
+                var el = els[i];
+                if (el.classList.contains('ZEmz6b')) { headerDate = parseDate(el.textContent) || headerDate; continue; }
+
+                var r = rectOf(el);
+                if (!r || !isReached(r)) continue;          // 视口下方的等翻到再处理
+                var visible = isFullyVisible(r);
+
+                var cb = el.querySelector('div[role="checkbox"]');
+                var aTag = el.querySelector('a.p137Zd');
+                var hrefId = aTag ? aTag.getAttribute('href') : null;
+                var ariaLabel = cb ? (cb.getAttribute('aria-label') || "") : "";
+                var key = hrefId || ariaLabel || null;
+                if (key && givenUp[key]) continue;
+
+                var checkedAttr = cb ? cb.getAttribute('aria-checked') : null;
+                var cbReady = !!cb && (checkedAttr === 'true' || checkedAttr === 'false');
+                var labelDate = ariaLabel ? parseDate(ariaLabel) : null;
+                var loaded = cbReady && (labelDate || hasThumb(el));
+
+                if (!loaded) {
+                    if (!visible) continue;                   // 已翻过视口：当时已等待/记录过
+                    if (!force) {
+                        st.pending++;
+                        if (!st.pendingSample) st.pendingSample = ariaLabel || '(无标签)';
+                        continue;
+                    }
+                    // 超时兜底：连复选框都没有，无法勾选，记为遗漏；有复选框则按所在分组日期继续处理
+                    if (!cbReady) { noteMissedOnce(key, labelDate || headerDate); continue; }
+                }
+
+                var dObj = labelDate || headerDate;
+                if (!dObj) {
+                    if (visible) { if (force) noteMissedOnce(key, null); else st.pending++; }
+                    continue;
+                }
+                if (!labelDate) {
+                    st.guessed++;
+                    if (!labelSampleLogged) {
+                        labelSampleLogged = true;
+                        addLog("ℹ️ 标签内无日期，改用分组日期 " + fmtDate(dObj) + "，样例: " + (ariaLabel.slice(0, 30) || '(空)'), "#9aa0a6");
+                    }
+                }
+
+                st.total++;
+                var shortLog = (labelDate ? (ariaLabel.split('-').pop() || "").trim() : "") || fmtDate(dObj);
+                st.lastLabel = shortLog;
+
+                if (dObj.getTime() > targetTS) { st.future++; continue; }
+
+                var isSaved = el.querySelector('.Q3N5Kd svg') !== null; // 与"状态高亮"同一判定：有图标 = 已保存
+
+                // 全量续传：边界日内，锚点之前的照片上一批已保存过
+                if (resumeAnchor && !anchorPassed) {
+                    if (dObj.getTime() === targetTS) {
+                        if (hrefId && hrefId === resumeAnchor.href) {
+                            anchorPassed = true;
+                            addLog("📍 定位到续传锚点: " + shortLog, "#1a73e8");
+                            if (isSaved) { st.resumed++; continue; }
+                        } else if (isSaved) {
+                            // 锚点之前且已保存：跳过；锚点之前但未保存的照常勾选，保证不漏
+                            st.resumed++; continue;
+                        }
+                    } else {
+                        anchorPassed = true;
+                        addLog("⚠️ 未定位到续传锚点，边界日已按差异方式补齐", "orange");
+                    }
+                }
+
+                // 差异模式：已保存（绿框）直接跳过
+                if (isDiffMode() && isSaved) { st.saved++; continue; }
+                if (checkedAttr !== 'false') continue;          // 已经勾上
+
+                updateUIStatus(shadow, "🎯 锁定: " + shortLog, getCount(), CONFIG.PHOTO_LIMIT);
+                var res = await clickAndVerify(cb);
+                if (!isRunning()) { st.stop = true; return st; }
+
+                if (res === 'ok') {
+                    st.clicked++;
+                    if (isSaved) st.saved++;
+                    addLog((isSaved ? "[全量重存] " : "[排雷勾选] ") + shortLog, isSaved ? "#81c995" : "#34a853");
+                    pushNode({ type: 'file', id: hrefId, dateStr: shortLog, dObj: dObj });
+                    if (getCount() >= CONFIG.PHOTO_LIMIT) { st.full = true; return st; }
+                } else {
+                    if (res === 'fail' && key) {
+                        clickFails[key] = (clickFails[key] || 0) + 1;
+                        if (clickFails[key] >= 2) {
+                            givenUp[key] = true;
+                            noteMissedOnce(key, dObj);
+                            addLog("⚠️ 多次点击未生效，已跳过: " + shortLog, "red");
+                            continue;
+                        }
+                    }
+                    st.pending++;   // 未确认勾上（元素被重绘或点击未生效），下一轮重新核验
+                }
+            }
+            return st;
+        }
+
+        // ---- 日期粒度单轮扫描（仅全量）：勾选日期复选框，整天照片不论是否已保存全部选中 ----
+        async function processDatePass(force) {
+            var st = { total: 0, saved: 0, future: 0, clicked: 0, resumed: 0, pending: 0, guessed: 0, lastLabel: "", pendingSample: "", stop: false, full: false };
+            var sections = document.querySelectorAll('.K0a18');
+
+            for (var j = 0; j < sections.length; j++) {
+                var s = sections[j], h2 = s.querySelector('h2.ZEmz6b');
+                if (!h2) continue;
+                var r = rectOf(h2);
+                if (!r || !isReached(r)) continue;
+                var visible = isFullyVisible(r);
+                var dateStr = h2.textContent;
+                var dObjDate = parseDate(dateStr);
+                if (!dObjDate) continue;
+
+                var cbDate = s.querySelector('div[role="checkbox"]');
+                var ca = cbDate ? cbDate.getAttribute('aria-checked') : null;
+                if (!cbDate || (ca !== 'true' && ca !== 'false')) {
+                    if (visible) {
+                        if (force) noteMissedOnce(dateStr, dObjDate);
+                        else { st.pending++; if (!st.pendingSample) st.pendingSample = dateStr; }
+                    }
+                    continue;
+                }
+                if (givenUp[dateStr]) continue;
+
+                st.total++;
+                st.lastLabel = dateStr;
+                if (!loggedScans[dateStr]) { loggedScans[dateStr] = true; addLog("[扫描] " + dateStr, "#9aa0a6"); }
+                if (dObjDate.getTime() > targetTS) { st.future++; continue; }
+                if (ca !== 'false') continue;
+
+                updateUIStatus(shadow, "🎯 锁定: " + dateStr, getCount(), CONFIG.PHOTO_LIMIT);
+                var dateAriaLabel = cbDate.getAttribute('aria-label');
+                var res = await clickAndVerify(cbDate);
+                if (!isRunning()) { st.stop = true; return st; }
+
+                if (res === 'ok') {
+                    st.clicked++;
+                    addLog("[日期模式] " + dateStr, "#34a853");
+                    pushNode({ type: 'date', id: dateStr, ariaLabel: dateAriaLabel, dateStr: dateStr, dObj: dObjDate });
+                    if (getCount() >= CONFIG.PHOTO_LIMIT) { st.full = true; return st; }
+                } else {
+                    if (res === 'fail') {
+                        clickFails[dateStr] = (clickFails[dateStr] || 0) + 1;
+                        if (clickFails[dateStr] >= 2) {
+                            givenUp[dateStr] = true;
+                            noteMissedOnce(dateStr, dObjDate);
+                            addLog("⚠️ 多次点击未生效，已跳过: " + dateStr, "red");
+                            continue;
+                        }
+                    }
+                    st.pending++;
+                }
+            }
+            return st;
+        }
 
         await new Promise(r => setTimeout(r, 1000));
         if (!CONFIG.JUST_SCROLL) {
-            addLog("策略: " + strategyLabel() + (resumeAnchor ? " | 续传锚点: " + resumeAnchor.date : ""), "cyan");
+            addLog("策略: " + strategyLabel() + " | 稳扫" + (resumeAnchor ? " | 续传锚点: " + resumeAnchor.date : ""), "cyan");
         }
         updateUIStatus(shadow, "⏳ 引擎运转中...", getCount(), CONFIG.PHOTO_LIMIT);
 
@@ -515,6 +775,7 @@
                 }
             }
 
+            // 跃迁：只用于快速越过"比 目标日期+缓冲天数 更新"的部分，这一段不勾选任何照片
             if (!isInfiniteTarget && minDateInView && (minDateInView > warpThresholdTS)) {
                 var showDate = new Date(minDateInView).toLocaleDateString();
                 var warpStatusStr = isFileGranularity() ? "🚀 全速直达 (" : "🚀 跃迁 (";
@@ -541,113 +802,71 @@
                 continue;
             }
 
-            if (isFileGranularity()) {
-                // ===== 文件粒度：逐张勾选（全量 = 全部勾选；差异 = 跳过已保存） =====
-                var photos = document.querySelectorAll('.rtIMgb');
-                var stat_total = 0, stat_saved = 0, stat_future = 0, stat_clicked = 0, stat_resumed = 0;
-                var latestScannedFileDate = "";
-
-                for (var i = 0; i < photos.length; i++) {
-                    var p = photos[i];
-                    var cb = p.querySelector('div[role="checkbox"]');
-                    if (!cb) continue;
-                    var ariaLabel = cb.getAttribute('aria-label') || "";
-                    var shortLog = (ariaLabel.split('-').pop() || "").trim();
-                    latestScannedFileDate = shortLog;
-                    var dObj = parseDate(ariaLabel);
-                    stat_total++;
-
-                    if (!dObj || dObj.getTime() > targetTS) { stat_future++; continue; }
-
-                    var isSaved = p.querySelector('.Q3N5Kd svg') !== null; // 与"状态高亮"同一判定：有图标 = 已保存
-                    var aTag = p.querySelector('a.p137Zd');
-                    var hrefId = aTag ? aTag.getAttribute('href') : null;
-
-                    // 全量续传：边界日内，锚点之前的照片上一批已保存过
-                    if (resumeAnchor && !anchorPassed) {
-                        if (dObj.getTime() === targetTS) {
-                            if (hrefId && hrefId === resumeAnchor.href) {
-                                anchorPassed = true;
-                                addLog("📍 定位到续传锚点: " + shortLog, "#1a73e8");
-                                if (isSaved) { stat_resumed++; continue; }
-                            } else if (isSaved) {
-                                // 锚点之前且已保存：跳过；锚点之前但未保存的照常勾选，保证不漏
-                                stat_resumed++; continue;
-                            }
-                        } else {
-                            anchorPassed = true;
-                            addLog("⚠️ 未定位到续传锚点，边界日已按差异方式补齐", "orange");
-                        }
-                    }
-
-                    // 差异模式：已保存（绿框）直接跳过
-                    if (isDiffMode() && isSaved) { stat_saved++; continue; }
-
-                    if (cb.getAttribute('aria-checked') === 'false') {
-                        stat_clicked++;
-                        if (isSaved) stat_saved++;
-                        addLog((isSaved ? "[全量重存] " : "[排雷勾选] ") + shortLog, isSaved ? "#81c995" : "#34a853");
-                        updateUIStatus(shadow, "🎯 锁定: " + shortLog, getCount(), CONFIG.PHOTO_LIMIT);
-                        var evts = ['mouseover', 'mousedown', 'mouseup', 'click'];
-                        evts.forEach(t => cb.dispatchEvent(new MouseEvent(t, {bubbles: true})));
-
-                        checkedNodesStack.push({ type: 'file', id: hrefId, dateStr: shortLog, dObj: dObj });
-
-                        tempLastDate = fmtDate(dObj);
-                        await new Promise(r => setTimeout(r, CONFIG.ACTION_SPEED));
-                        if (localStorage.getItem(AUTO_RUN_KEY) !== 'true') return;
-                        if (getCount() >= CONFIG.PHOTO_LIMIT) break;
-                    }
-                }
-                if (latestScannedFileDate && stat_clicked === 0) updateUIStatus(shadow, "👁️ 扫视: " + latestScannedFileDate, getCount(), CONFIG.PHOTO_LIMIT);
-                if (stat_total > 0 && getCount() < CONFIG.PHOTO_LIMIT && (stat_saved > 0 || stat_future > 0 || stat_resumed > 0)) {
-                    if (isDiffMode()) {
-                        addLog(`雷达[差异]: 扫${stat_total}|跳过已存${stat_saved}|拦${stat_future}|勾${stat_clicked}`, "#888");
-                    } else {
-                        addLog(`雷达[全量]: 扫${stat_total}|拦${stat_future}|勾${stat_clicked}(含已存${stat_saved})` + (stat_resumed ? `|续传跳过${stat_resumed}` : ''), "#888");
-                    }
-                }
+            if (CONFIG.JUST_SCROLL) {
+                // 仅翻页寻址：抵达目标日期即停，不勾选
+                if (minDateInView && minDateInView <= targetTS) { addLog("📍 已抵达寻址目标", "lime"); break; }
+                updateUIStatus(shadow, "🧭 寻址中...", getCount(), CONFIG.PHOTO_LIMIT);
             } else {
-                // ===== 日期粒度（仅全量）：勾选日期复选框，整天照片不论是否已保存全部选中 =====
-                for (var j = 0; j < sections.length; j++) {
-                    var s = sections[j], h2 = s.querySelector('h2.ZEmz6b');
-                    if (!h2) continue;
-                    var dateStr = h2.textContent;
-                    updateUIStatus(shadow, "👁️ 扫视: " + dateStr, getCount(), CONFIG.PHOTO_LIMIT);
-                    if (!loggedScans[dateStr]) { loggedScans[dateStr] = true; addLog("[扫描] " + dateStr, "#9aa0a6"); }
-                    var dObjDate = parseDate(dateStr);
-                    if (dObjDate && dObjDate.getTime() <= targetTS) {
-                        var cbDate = s.querySelector('div[role="checkbox"]');
-                        if (cbDate && cbDate.getAttribute('aria-checked') === 'false') {
-                            addLog("[日期模式] " + dateStr, "#34a853");
-                            updateUIStatus(shadow, "🎯 锁定: " + dateStr, getCount(), CONFIG.PHOTO_LIMIT);
+                // ===== 稳扫：当前视口全部加载就绪、全部勾选并核验通过后才下翻 =====
+                var screenStart = Date.now(), settleStart = Date.now(), nudged = false;
+                var lastSt = null, clickedSum = 0, isFull = false;
 
-                            var dateAriaLabel = cbDate.getAttribute('aria-label');
+                while (true) {
+                    var st = isFileGranularity() ? await processFilePass(false) : await processDatePass(false);
+                    if (st.stop) { updateUIStatus(shadow, "⏸️ 已挂起", getCount(), CONFIG.PHOTO_LIMIT); return; }
+                    lastSt = st; clickedSum += st.clicked;
+                    if (st.full) { isFull = true; break; }
+                    if (st.pending === 0 && st.clicked === 0) break;     // 一整轮无待加载、无新勾选 = 本屏核验通过
+                    if (st.clicked > 0) settleStart = Date.now();       // 有进展就重新计时
 
-                            var evtsDate = ['mouseover', 'mousedown', 'mouseup', 'click'];
-                            evtsDate.forEach(t => cbDate.dispatchEvent(new MouseEvent(t, {bubbles: true})));
+                    if (st.pending > 0) {
+                        updateUIStatus(shadow, "⏳ 等待加载 (" + st.pending + ")", getCount(), CONFIG.PHOTO_LIMIT);
+                        if (Date.now() - settleStart > loadTimeout()) {
+                            if (!nudged) {
+                                nudged = true; settleStart = Date.now();
+                                addLog("⏳ 本屏 " + st.pending + " 项超时未加载，尝试唤醒渲染… 样例: " + String(st.pendingSample).slice(0, 30), "orange");
+                                nudgeRender();
+                            } else {
+                                var missedBefore = missed.count;
+                                var fst = isFileGranularity() ? await processFilePass(true) : await processDatePass(true);
+                                if (fst.stop) { updateUIStatus(shadow, "⏸️ 已挂起", getCount(), CONFIG.PHOTO_LIMIT); return; }
+                                lastSt = fst; clickedSum += fst.clicked;
+                                if (fst.full) isFull = true;
+                                var lost = missed.count - missedBefore;
+                                if (lost > 0) addLog("⚠️ 本屏 " + lost + " 项始终未加载，无法勾选" + (isDiffMode() ? "（保存成功后进度回退以便补扫）" : ""), "red");
+                                break;
+                            }
+                        }
+                    }
+                    await sleep(st.clicked > 0 ? 50 : 150);
+                }
 
-                            checkedNodesStack.push({ type: 'date', id: dateStr, ariaLabel: dateAriaLabel, dateStr: dateStr, dObj: dObjDate });
-
-                            tempLastDate = fmtDate(dObjDate);
-                            await new Promise(r => setTimeout(r, CONFIG.ACTION_SPEED));
-                            if (localStorage.getItem(AUTO_RUN_KEY) !== 'true') return;
-                            if (getCount() >= CONFIG.PHOTO_LIMIT) break;
+                if (lastSt && lastSt.total > 0) {
+                    if (clickedSum === 0 && lastSt.lastLabel) updateUIStatus(shadow, "👁️ 扫视: " + lastSt.lastLabel, getCount(), CONFIG.PHOTO_LIMIT);
+                    if (isFileGranularity()) {
+                        var waitMs = Date.now() - screenStart;
+                        var tail = (lastSt.guessed ? `|分组日期${lastSt.guessed}` : '') + (waitMs > 1000 ? `|等待${(waitMs / 1000).toFixed(1)}s` : '');
+                        if (isDiffMode()) {
+                            addLog(`雷达[差异]: 扫${lastSt.total}|跳过已存${lastSt.saved}|超范围${lastSt.future}|勾${clickedSum}` + tail, "#888");
+                        } else {
+                            addLog(`雷达[全量]: 扫${lastSt.total}|超范围${lastSt.future}|勾${clickedSum}` + (lastSt.resumed ? `|续传跳过${lastSt.resumed}` : '') + tail, "#888");
                         }
                     }
                 }
+                if (isFull) break;
             }
 
             if (!CONFIG.JUST_SCROLL && getCount() >= CONFIG.PHOTO_LIMIT) break;
-            var anchors = document.querySelectorAll('.rtIMgb, .K0a18'), lastA = anchors[anchors.length - 1];
-            if (lastA) lastA.scrollIntoView({ behavior: 'auto', block: 'end' });
-            else window.scrollBy(0, 1500);
-            await new Promise(r => setTimeout(r, CONFIG.SCROLL_WAIT));
 
-            if (currentList === lastList && sections.length > 0) {
+            // 步进下翻（每次只翻到第一个未完整露出的元素）
+            var sigBefore = contentSignature();
+            var moved = await stepScroll();
+            await new Promise(r => setTimeout(r, CONFIG.SCROLL_WAIT));
+            if (!moved && contentSignature() === sigBefore) {
                 retry++; addLog("触底探测 (" + retry + "/" + CONFIG.MAX_RETRY + ")", "yellow");
                 if (retry >= CONFIG.MAX_RETRY) { addLog("物理触底，结算...", "white"); break; }
-            } else { retry = 0; lastList = currentList; }
+            } else { retry = 0; }
+            lastList = currentList;
         }
 
         // --- 7. 内循环保存架构 ---
@@ -715,6 +934,34 @@
                         }
                     } else {
                         clearAnchor();
+                    }
+
+                    // 本批有照片始终未能勾选：差异模式回退进度以便补扫（同一位置只回退一次，防止死循环）
+                    if (missed.count > 0) {
+                        if (isDiffMode()) {
+                            var rewindStr = diskSaved;
+                            if (missed.newest) {
+                                var rd = new Date(missed.newest.getTime());
+                                rd.setDate(rd.getDate() + 1);
+                                rewindStr = fmtDate(rd);
+                            }
+                            var needRewind = (rewindStr === "")
+                                ? (dateToSave !== "")
+                                : (dateToSave !== "" && ymdTime(rewindStr) > ymdTime(dateToSave));
+                            if (needRewind) {
+                                if (localStorage.getItem(REWIND_KEY) === rewindStr) {
+                                    addLog("⚠️ " + (rewindStr || "起始") + " 附近补扫后仍有遗漏，不再回退，请人工检查", "red");
+                                } else {
+                                    localStorage.setItem(REWIND_KEY, rewindStr);
+                                    dateToSave = rewindStr;
+                                    addLog("↩️ 本批 " + missed.count + " 张未能勾选，进度回退至 " + (rewindStr || "起始") + " 以便补扫", "orange");
+                                }
+                            }
+                        } else {
+                            addLog("⚠️ 本批 " + missed.count + " 张未能勾选（全量模式不回退进度），建议之后用差异模式补扫", "orange");
+                        }
+                    } else {
+                        localStorage.removeItem(REWIND_KEY);
                     }
 
                     localStorage.setItem(STORAGE_KEY, dateToSave);
